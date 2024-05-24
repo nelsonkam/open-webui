@@ -40,6 +40,8 @@ export const sanitizeResponseContent = (content: string) => {
 		.replaceAll('\n\\]', '\\\\]')
 		.replaceAll('$$\n', '$$')
 		.replaceAll('\n$$', '$$')
+		.replaceAll('$\n', '$')
+		.replaceAll('\n$', '$')
 		.replaceAll('\\(', '\\\\(')
 		.replaceAll('\\)', '\\\\)')
 		.trim();
