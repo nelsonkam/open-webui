@@ -3,6 +3,7 @@
 	import dayjs from 'dayjs';
 	import { marked } from 'marked';
 	import tippy from 'tippy.js';
+	import katex from 'katex';
 	import auto_render from 'katex/dist/contrib/auto-render.mjs';
 	import 'katex/dist/katex.min.css';
 
@@ -147,11 +148,11 @@
 					// customised options
 					// • auto-render specific keys, e.g.:
 					delimiters: [
-						{ left: '$$', right: '$$', display: false },
+						{ left: '$$', right: '$$', display: true },
 						{ left: '$ ', right: ' $', display: false },
 						{ left: '\\(', right: '\\)', display: false },
-						{ left: '\\[', right: '\\]', display: false },
-						{ left: '[ ', right: ' ]', display: false }
+						{ left: '\\[', right: '\\]', display: true },
+						{ left: '[ ', right: ' ]', display: true }
 					],
 					// • rendering keys, e.g.:
 					throwOnError: false
