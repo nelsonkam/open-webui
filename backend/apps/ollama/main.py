@@ -29,8 +29,10 @@ import time
 from urllib.parse import urlparse
 from typing import Optional, List, Union
 
+from starlette.background import BackgroundTask
 
-from apps.web.models.users import Users
+from apps.webui.models.models import Models
+from apps.webui.models.users import Users
 from constants import ERROR_MESSAGES
 from utils.utils import (
     decode_token,
@@ -38,17 +40,20 @@ from utils.utils import (
     get_verified_user,
     get_admin_user,
 )
+from utils.task import prompt_template
 
 
 from config import (
     SRC_LOG_LEVELS,
     OLLAMA_BASE_URLS,
+    ENABLE_OLLAMA_API,
+    AIOHTTP_CLIENT_TIMEOUT,
     ENABLE_MODEL_FILTER,
     MODEL_FILTER_LIST,
     UPLOAD_DIR,
     AppConfig,
 )
-from utils.misc import calculate_sha256
+from utils.misc import calculate_sha256, add_or_update_system_message
 
 log = logging.getLogger(__name__)
 log.setLevel(SRC_LOG_LEVELS["OLLAMA"])
@@ -67,11 +72,9 @@ app.state.config = AppConfig()
 app.state.config.ENABLE_MODEL_FILTER = ENABLE_MODEL_FILTER
 app.state.config.MODEL_FILTER_LIST = MODEL_FILTER_LIST
 
+app.state.config.ENABLE_OLLAMA_API = ENABLE_OLLAMA_API
 app.state.config.OLLAMA_BASE_URLS = OLLAMA_BASE_URLS
 app.state.MODELS = {}
-
-
-REQUEST_POOL = []
 
 
 # TODO: Implement a more intelligent load balancing mechanism for distributing requests among multiple backend instances.
@@ -96,6 +99,21 @@ async def get_status():
     return {"status": True}
 
 
+@app.get("/config")
+async def get_config(user=Depends(get_admin_user)):
+    return {"ENABLE_OLLAMA_API": app.state.config.ENABLE_OLLAMA_API}
+
+
+class OllamaConfigForm(BaseModel):
+    enable_ollama_api: Optional[bool] = None
+
+
+@app.post("/config/update")
+async def update_config(form_data: OllamaConfigForm, user=Depends(get_admin_user)):
+    app.state.config.ENABLE_OLLAMA_API = form_data.enable_ollama_api
+    return {"ENABLE_OLLAMA_API": app.state.config.ENABLE_OLLAMA_API}
+
+
 @app.get("/urls")
 async def get_ollama_api_urls(user=Depends(get_admin_user)):
     return {"OLLAMA_BASE_URLS": app.state.config.OLLAMA_BASE_URLS}
@@ -113,26 +131,57 @@ async def update_ollama_api_url(form_data: UrlUpdateForm, user=Depends(get_admin
     return {"OLLAMA_BASE_URLS": app.state.config.OLLAMA_BASE_URLS}
 
 
-@app.get("/cancel/{request_id}")
-async def cancel_ollama_request(request_id: str, user=Depends(get_current_user)):
-    if user:
-        if request_id in REQUEST_POOL:
-            REQUEST_POOL.remove(request_id)
-        return True
-    else:
-        raise HTTPException(status_code=401, detail=ERROR_MESSAGES.ACCESS_PROHIBITED)
-
-
 async def fetch_url(url):
     timeout = aiohttp.ClientTimeout(total=5)
     try:
-        async with aiohttp.ClientSession(timeout=timeout) as session:
+        async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(url) as response:
                 return await response.json()
     except Exception as e:
         # Handle connection error here
         log.error(f"Connection error: {e}")
         return None
+
+
+async def cleanup_response(
+    response: Optional[aiohttp.ClientResponse],
+    session: Optional[aiohttp.ClientSession],
+):
+    if response:
+        response.close()
+    if session:
+        await session.close()
+
+
+async def post_streaming_url(url: str, payload: str):
+    r = None
+    try:
+        session = aiohttp.ClientSession(
+            trust_env=True, timeout=aiohttp.ClientTimeout(total=AIOHTTP_CLIENT_TIMEOUT)
+        )
+        r = await session.post(url, data=payload)
+        r.raise_for_status()
+
+        return StreamingResponse(
+            r.content,
+            status_code=r.status,
+            headers=dict(r.headers),
+            background=BackgroundTask(cleanup_response, response=r, session=session),
+        )
+    except Exception as e:
+        error_detail = "Open WebUI: Server Connection Error"
+        if r is not None:
+            try:
+                res = await r.json()
+                if "error" in res:
+                    error_detail = f"Ollama: {res['error']}"
+            except:
+                error_detail = f"Ollama: {e}"
+
+        raise HTTPException(
+            status_code=r.status if r else 500,
+            detail=error_detail,
+        )
 
 
 def merge_models_lists(model_lists):
@@ -151,19 +200,25 @@ def merge_models_lists(model_lists):
     return list(merged_models.values())
 
 
-# user=Depends(get_current_user)
-
-
 async def get_all_models():
     log.info("get_all_models()")
-    tasks = [fetch_url(f"{url}/api/tags") for url in app.state.config.OLLAMA_BASE_URLS]
-    responses = await asyncio.gather(*tasks)
 
-    models = {
-        "models": merge_models_lists(
-            map(lambda response: response["models"] if response else None, responses)
-        )
-    }
+    if app.state.config.ENABLE_OLLAMA_API:
+        tasks = [
+            fetch_url(f"{url}/api/tags") for url in app.state.config.OLLAMA_BASE_URLS
+        ]
+        responses = await asyncio.gather(*tasks)
+
+        models = {
+            "models": merge_models_lists(
+                map(
+                    lambda response: response["models"] if response else None, responses
+                )
+            )
+        }
+
+    else:
+        models = {"models": []}
 
     app.state.MODELS = {model["model"]: model for model in models["models"]}
 
@@ -191,6 +246,8 @@ async def get_ollama_tags(
         return models
     else:
         url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+
+        r = None
         try:
             r = requests.request(method="GET", url=f"{url}/api/tags")
             r.raise_for_status()
@@ -216,52 +273,57 @@ async def get_ollama_tags(
 @app.get("/api/version")
 @app.get("/api/version/{url_idx}")
 async def get_ollama_versions(url_idx: Optional[int] = None):
+    if app.state.config.ENABLE_OLLAMA_API:
+        if url_idx == None:
 
-    if url_idx == None:
+            # returns lowest version
+            tasks = [
+                fetch_url(f"{url}/api/version")
+                for url in app.state.config.OLLAMA_BASE_URLS
+            ]
+            responses = await asyncio.gather(*tasks)
+            responses = list(filter(lambda x: x is not None, responses))
 
-        # returns lowest version
-        tasks = [
-            fetch_url(f"{url}/api/version") for url in app.state.config.OLLAMA_BASE_URLS
-        ]
-        responses = await asyncio.gather(*tasks)
-        responses = list(filter(lambda x: x is not None, responses))
+            if len(responses) > 0:
+                lowest_version = min(
+                    responses,
+                    key=lambda x: tuple(
+                        map(int, re.sub(r"^v|-.*", "", x["version"]).split("."))
+                    ),
+                )
 
-        if len(responses) > 0:
-            lowest_version = min(
-                responses,
-                key=lambda x: tuple(
-                    map(int, re.sub(r"^v|-.*", "", x["version"]).split("."))
-                ),
-            )
-
-            return {"version": lowest_version["version"]}
+                return {"version": lowest_version["version"]}
+            else:
+                raise HTTPException(
+                    status_code=500,
+                    detail=ERROR_MESSAGES.OLLAMA_NOT_FOUND,
+                )
         else:
-            raise HTTPException(
-                status_code=500,
-                detail=ERROR_MESSAGES.OLLAMA_NOT_FOUND,
-            )
+            url = app.state.config.OLLAMA_BASE_URLS[url_idx]
+
+            r = None
+            try:
+                r = requests.request(method="GET", url=f"{url}/api/version")
+                r.raise_for_status()
+
+                return r.json()
+            except Exception as e:
+                log.exception(e)
+                error_detail = "Open WebUI: Server Connection Error"
+                if r is not None:
+                    try:
+                        res = r.json()
+                        if "error" in res:
+                            error_detail = f"Ollama: {res['error']}"
+                    except:
+                        error_detail = f"Ollama: {e}"
+
+                raise HTTPException(
+                    status_code=r.status_code if r else 500,
+                    detail=error_detail,
+                )
     else:
-        url = app.state.config.OLLAMA_BASE_URLS[url_idx]
-        try:
-            r = requests.request(method="GET", url=f"{url}/api/version")
-            r.raise_for_status()
-
-            return r.json()
-        except Exception as e:
-            log.exception(e)
-            error_detail = "Open WebUI: Server Connection Error"
-            if r is not None:
-                try:
-                    res = r.json()
-                    if "error" in res:
-                        error_detail = f"Ollama: {res['error']}"
-                except:
-                    error_detail = f"Ollama: {e}"
-
-            raise HTTPException(
-                status_code=r.status_code if r else 500,
-                detail=error_detail,
-            )
+        return {"version": False}
 
 
 class ModelNameForm(BaseModel):
@@ -278,65 +340,10 @@ async def pull_model(
 
     r = None
 
-    def get_request():
-        nonlocal url
-        nonlocal r
+    # Admin should be able to pull models from any source
+    payload = {**form_data.model_dump(exclude_none=True), "insecure": True}
 
-        request_id = str(uuid.uuid4())
-        try:
-            REQUEST_POOL.append(request_id)
-
-            def stream_content():
-                try:
-                    yield json.dumps({"id": request_id, "done": False}) + "\n"
-
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if request_id in REQUEST_POOL:
-                            yield chunk
-                        else:
-                            log.warning("User: canceled request")
-                            break
-                finally:
-                    if hasattr(r, "close"):
-                        r.close()
-                        if request_id in REQUEST_POOL:
-                            REQUEST_POOL.remove(request_id)
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/api/pull",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-
-    except Exception as e:
-        log.exception(e)
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(f"{url}/api/pull", json.dumps(payload))
 
 
 class PushModelForm(BaseModel):
@@ -364,50 +371,9 @@ async def push_model(
     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
     log.debug(f"url: {url}")
 
-    r = None
-
-    def get_request():
-        nonlocal url
-        nonlocal r
-        try:
-
-            def stream_content():
-                for chunk in r.iter_content(chunk_size=8192):
-                    yield chunk
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/api/push",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-            )
-
-            r.raise_for_status()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        log.exception(e)
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(
+        f"{url}/api/push", form_data.model_dump_json(exclude_none=True).encode()
+    )
 
 
 class CreateModelForm(BaseModel):
@@ -426,53 +392,9 @@ async def create_model(
     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
     log.info(f"url: {url}")
 
-    r = None
-
-    def get_request():
-        nonlocal url
-        nonlocal r
-        try:
-
-            def stream_content():
-                for chunk in r.iter_content(chunk_size=8192):
-                    yield chunk
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/api/create",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            log.debug(f"r: {r}")
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        log.exception(e)
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(
+        f"{url}/api/create", form_data.model_dump_json(exclude_none=True).encode()
+    )
 
 
 class CopyModelForm(BaseModel):
@@ -762,66 +684,9 @@ async def generate_completion(
     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
     log.info(f"url: {url}")
 
-    r = None
-
-    def get_request():
-        nonlocal form_data
-        nonlocal r
-
-        request_id = str(uuid.uuid4())
-        try:
-            REQUEST_POOL.append(request_id)
-
-            def stream_content():
-                try:
-                    if form_data.stream:
-                        yield json.dumps({"id": request_id, "done": False}) + "\n"
-
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if request_id in REQUEST_POOL:
-                            yield chunk
-                        else:
-                            log.warning("User: canceled request")
-                            break
-                finally:
-                    if hasattr(r, "close"):
-                        r.close()
-                        if request_id in REQUEST_POOL:
-                            REQUEST_POOL.remove(request_id)
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/api/generate",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(
+        f"{url}/api/generate", form_data.model_dump_json(exclude_none=True).encode()
+    )
 
 
 class ChatMessage(BaseModel):
@@ -848,14 +713,137 @@ async def generate_chat_completion(
     user=Depends(get_verified_user),
 ):
 
+    log.debug(
+        "form_data.model_dump_json(exclude_none=True).encode(): {0} ".format(
+            form_data.model_dump_json(exclude_none=True).encode()
+        )
+    )
+
+    payload = {
+        **form_data.model_dump(exclude_none=True),
+    }
+
+    model_id = form_data.model
+    model_info = Models.get_model_by_id(model_id)
+
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+
+        model_info.params = model_info.params.model_dump()
+
+        if model_info.params:
+            payload["options"] = {}
+
+            if model_info.params.get("mirostat", None):
+                payload["options"]["mirostat"] = model_info.params.get("mirostat", None)
+
+            if model_info.params.get("mirostat_eta", None):
+                payload["options"]["mirostat_eta"] = model_info.params.get(
+                    "mirostat_eta", None
+                )
+
+            if model_info.params.get("mirostat_tau", None):
+
+                payload["options"]["mirostat_tau"] = model_info.params.get(
+                    "mirostat_tau", None
+                )
+
+            if model_info.params.get("num_ctx", None):
+                payload["options"]["num_ctx"] = model_info.params.get("num_ctx", None)
+
+            if model_info.params.get("num_batch", None):
+                payload["options"]["num_batch"] = model_info.params.get(
+                    "num_batch", None
+                )
+
+            if model_info.params.get("num_keep", None):
+                payload["options"]["num_keep"] = model_info.params.get("num_keep", None)
+
+            if model_info.params.get("repeat_last_n", None):
+                payload["options"]["repeat_last_n"] = model_info.params.get(
+                    "repeat_last_n", None
+                )
+
+            if model_info.params.get("frequency_penalty", None):
+                payload["options"]["repeat_penalty"] = model_info.params.get(
+                    "frequency_penalty", None
+                )
+
+            if model_info.params.get("temperature", None) is not None:
+                payload["options"]["temperature"] = model_info.params.get(
+                    "temperature", None
+                )
+
+            if model_info.params.get("seed", None):
+                payload["options"]["seed"] = model_info.params.get("seed", None)
+
+            if model_info.params.get("stop", None):
+                payload["options"]["stop"] = (
+                    [
+                        bytes(stop, "utf-8").decode("unicode_escape")
+                        for stop in model_info.params["stop"]
+                    ]
+                    if model_info.params.get("stop", None)
+                    else None
+                )
+
+            if model_info.params.get("tfs_z", None):
+                payload["options"]["tfs_z"] = model_info.params.get("tfs_z", None)
+
+            if model_info.params.get("max_tokens", None):
+                payload["options"]["num_predict"] = model_info.params.get(
+                    "max_tokens", None
+                )
+
+            if model_info.params.get("top_k", None):
+                payload["options"]["top_k"] = model_info.params.get("top_k", None)
+
+            if model_info.params.get("top_p", None):
+                payload["options"]["top_p"] = model_info.params.get("top_p", None)
+
+            if model_info.params.get("use_mmap", None):
+                payload["options"]["use_mmap"] = model_info.params.get("use_mmap", None)
+
+            if model_info.params.get("use_mlock", None):
+                payload["options"]["use_mlock"] = model_info.params.get(
+                    "use_mlock", None
+                )
+
+            if model_info.params.get("num_thread", None):
+                payload["options"]["num_thread"] = model_info.params.get(
+                    "num_thread", None
+                )
+
+        system = model_info.params.get("system", None)
+        if system:
+            # Check if the payload already has a system message
+            # If not, add a system message to the payload
+            system = prompt_template(
+                system,
+                **(
+                    {
+                        "user_name": user.name,
+                        "user_location": (
+                            user.info.get("location") if user.info else None
+                        ),
+                    }
+                    if user
+                    else {}
+                ),
+            )
+
+            if payload.get("messages"):
+                payload["messages"] = add_or_update_system_message(
+                    system, payload["messages"]
+                )
+
     if url_idx == None:
-        model = form_data.model
+        if ":" not in payload["model"]:
+            payload["model"] = f"{payload['model']}:latest"
 
-        if ":" not in model:
-            model = f"{model}:latest"
-
-        if model in app.state.MODELS:
-            url_idx = random.choice(app.state.MODELS[model]["urls"])
+        if payload["model"] in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[payload["model"]]["urls"])
         else:
             raise HTTPException(
                 status_code=400,
@@ -864,80 +852,20 @@ async def generate_chat_completion(
 
     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
     log.info(f"url: {url}")
+    log.debug(payload)
 
-    r = None
-
-    log.debug(
-        "form_data.model_dump_json(exclude_none=True).encode(): {0} ".format(
-            form_data.model_dump_json(exclude_none=True).encode()
-        )
-    )
-
-    def get_request():
-        nonlocal form_data
-        nonlocal r
-
-        request_id = str(uuid.uuid4())
-        try:
-            REQUEST_POOL.append(request_id)
-
-            def stream_content():
-                try:
-                    if form_data.stream:
-                        yield json.dumps({"id": request_id, "done": False}) + "\n"
-
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if request_id in REQUEST_POOL:
-                            yield chunk
-                        else:
-                            log.warning("User: canceled request")
-                            break
-                finally:
-                    if hasattr(r, "close"):
-                        r.close()
-                        if request_id in REQUEST_POOL:
-                            REQUEST_POOL.remove(request_id)
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/api/chat",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            log.exception(e)
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(f"{url}/api/chat", json.dumps(payload))
 
 
 # TODO: we should update this part once Ollama supports other types
+class OpenAIChatMessageContent(BaseModel):
+    type: str
+    model_config = ConfigDict(extra="allow")
+
+
 class OpenAIChatMessage(BaseModel):
     role: str
-    content: str
+    content: Union[str, OpenAIChatMessageContent]
 
     model_config = ConfigDict(extra="allow")
 
@@ -952,19 +880,80 @@ class OpenAIChatCompletionForm(BaseModel):
 @app.post("/v1/chat/completions")
 @app.post("/v1/chat/completions/{url_idx}")
 async def generate_openai_chat_completion(
-    form_data: OpenAIChatCompletionForm,
+    form_data: dict,
     url_idx: Optional[int] = None,
     user=Depends(get_verified_user),
 ):
+    form_data = OpenAIChatCompletionForm(**form_data)
+
+    payload = {
+        **form_data.model_dump(exclude_none=True),
+    }
+
+    model_id = form_data.model
+    model_info = Models.get_model_by_id(model_id)
+
+    if model_info:
+        if model_info.base_model_id:
+            payload["model"] = model_info.base_model_id
+
+        model_info.params = model_info.params.model_dump()
+
+        if model_info.params:
+            payload["temperature"] = model_info.params.get("temperature", None)
+            payload["top_p"] = model_info.params.get("top_p", None)
+            payload["max_tokens"] = model_info.params.get("max_tokens", None)
+            payload["frequency_penalty"] = model_info.params.get(
+                "frequency_penalty", None
+            )
+            payload["seed"] = model_info.params.get("seed", None)
+            payload["stop"] = (
+                [
+                    bytes(stop, "utf-8").decode("unicode_escape")
+                    for stop in model_info.params["stop"]
+                ]
+                if model_info.params.get("stop", None)
+                else None
+            )
+
+        system = model_info.params.get("system", None)
+
+        if system:
+            system = prompt_template(
+                system,
+                **(
+                    {
+                        "user_name": user.name,
+                        "user_location": (
+                            user.info.get("location") if user.info else None
+                        ),
+                    }
+                    if user
+                    else {}
+                ),
+            )
+            # Check if the payload already has a system message
+            # If not, add a system message to the payload
+            if payload.get("messages"):
+                for message in payload["messages"]:
+                    if message.get("role") == "system":
+                        message["content"] = system + message["content"]
+                        break
+                else:
+                    payload["messages"].insert(
+                        0,
+                        {
+                            "role": "system",
+                            "content": system,
+                        },
+                    )
 
     if url_idx == None:
-        model = form_data.model
+        if ":" not in payload["model"]:
+            payload["model"] = f"{payload['model']}:latest"
 
-        if ":" not in model:
-            model = f"{model}:latest"
-
-        if model in app.state.MODELS:
-            url_idx = random.choice(app.state.MODELS[model]["urls"])
+        if payload["model"] in app.state.MODELS:
+            url_idx = random.choice(app.state.MODELS[payload["model"]]["urls"])
         else:
             raise HTTPException(
                 status_code=400,
@@ -974,68 +963,7 @@ async def generate_openai_chat_completion(
     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
     log.info(f"url: {url}")
 
-    r = None
-
-    def get_request():
-        nonlocal form_data
-        nonlocal r
-
-        request_id = str(uuid.uuid4())
-        try:
-            REQUEST_POOL.append(request_id)
-
-            def stream_content():
-                try:
-                    if form_data.stream:
-                        yield json.dumps(
-                            {"request_id": request_id, "done": False}
-                        ) + "\n"
-
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if request_id in REQUEST_POOL:
-                            yield chunk
-                        else:
-                            log.warning("User: canceled request")
-                            break
-                finally:
-                    if hasattr(r, "close"):
-                        r.close()
-                        if request_id in REQUEST_POOL:
-                            REQUEST_POOL.remove(request_id)
-
-            r = requests.request(
-                method="POST",
-                url=f"{url}/v1/chat/completions",
-                data=form_data.model_dump_json(exclude_none=True).encode(),
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
+    return await post_streaming_url(f"{url}/v1/chat/completions", json.dumps(payload))
 
 
 @app.get("/v1/models")
@@ -1147,7 +1075,7 @@ async def download_file_stream(
 
     timeout = aiohttp.ClientTimeout(total=600)  # Set the timeout
 
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
         async with session.get(file_url, headers=headers) as response:
             total_size = int(response.headers.get("content-length", 0)) + current_size
 
@@ -1182,17 +1110,13 @@ async def download_file_stream(
                         raise "Ollama: Could not create blob, Please try again."
 
 
-# def number_generator():
-#     for i in range(1, 101):
-#         yield f"data: {i}\n"
-
-
 # url = "https://huggingface.co/TheBloke/stablelm-zephyr-3b-GGUF/resolve/main/stablelm-zephyr-3b.Q2_K.gguf"
 @app.post("/models/download")
 @app.post("/models/download/{url_idx}")
 async def download_model(
     form_data: UrlForm,
     url_idx: Optional[int] = None,
+    user=Depends(get_admin_user),
 ):
 
     allowed_hosts = ["https://huggingface.co/", "https://github.com/"]
@@ -1221,7 +1145,11 @@ async def download_model(
 
 @app.post("/models/upload")
 @app.post("/models/upload/{url_idx}")
-def upload_model(file: UploadFile = File(...), url_idx: Optional[int] = None):
+def upload_model(
+    file: UploadFile = File(...),
+    url_idx: Optional[int] = None,
+    user=Depends(get_admin_user),
+):
     if url_idx == None:
         url_idx = 0
     ollama_url = app.state.config.OLLAMA_BASE_URLS[url_idx]
@@ -1284,137 +1212,3 @@ def upload_model(file: UploadFile = File(...), url_idx: Optional[int] = None):
             yield f"data: {json.dumps(res)}\n\n"
 
     return StreamingResponse(file_process_stream(), media_type="text/event-stream")
-
-
-# async def upload_model(file: UploadFile = File(), url_idx: Optional[int] = None):
-#     if url_idx == None:
-#         url_idx = 0
-#     url = app.state.config.OLLAMA_BASE_URLS[url_idx]
-
-#     file_location = os.path.join(UPLOAD_DIR, file.filename)
-#     total_size = file.size
-
-#     async def file_upload_generator(file):
-#         print(file)
-#         try:
-#             async with aiofiles.open(file_location, "wb") as f:
-#                 completed_size = 0
-#                 while True:
-#                     chunk = await file.read(1024*1024)
-#                     if not chunk:
-#                         break
-#                     await f.write(chunk)
-#                     completed_size += len(chunk)
-#                     progress = (completed_size / total_size) * 100
-
-#                     print(progress)
-#                     yield f'data: {json.dumps({"status": "uploading", "percentage": progress, "total": total_size, "completed": completed_size, "done": False})}\n'
-#         except Exception as e:
-#             print(e)
-#             yield f"data: {json.dumps({'status': 'error', 'message': str(e)})}\n"
-#         finally:
-#             await file.close()
-#             print("done")
-#             yield f'data: {json.dumps({"status": "completed", "percentage": 100, "total": total_size, "completed": completed_size, "done": True})}\n'
-
-#     return StreamingResponse(
-#         file_upload_generator(copy.deepcopy(file)), media_type="text/event-stream"
-#     )
-
-
-@app.api_route("/{path:path}", methods=["GET", "POST", "PUT", "DELETE"])
-async def deprecated_proxy(
-    path: str, request: Request, user=Depends(get_verified_user)
-):
-    url = app.state.config.OLLAMA_BASE_URLS[0]
-    target_url = f"{url}/{path}"
-
-    body = await request.body()
-    headers = dict(request.headers)
-
-    if user.role in ["user", "admin"]:
-        if path in ["pull", "delete", "push", "copy", "create"]:
-            if user.role != "admin":
-                raise HTTPException(
-                    status_code=status.HTTP_401_UNAUTHORIZED,
-                    detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-                )
-    else:
-        raise HTTPException(
-            status_code=status.HTTP_401_UNAUTHORIZED,
-            detail=ERROR_MESSAGES.ACCESS_PROHIBITED,
-        )
-
-    headers.pop("host", None)
-    headers.pop("authorization", None)
-    headers.pop("origin", None)
-    headers.pop("referer", None)
-
-    r = None
-
-    def get_request():
-        nonlocal r
-
-        request_id = str(uuid.uuid4())
-        try:
-            REQUEST_POOL.append(request_id)
-
-            def stream_content():
-                try:
-                    if path == "generate":
-                        data = json.loads(body.decode("utf-8"))
-
-                        if not ("stream" in data and data["stream"] == False):
-                            yield json.dumps({"id": request_id, "done": False}) + "\n"
-
-                    elif path == "chat":
-                        yield json.dumps({"id": request_id, "done": False}) + "\n"
-
-                    for chunk in r.iter_content(chunk_size=8192):
-                        if request_id in REQUEST_POOL:
-                            yield chunk
-                        else:
-                            log.warning("User: canceled request")
-                            break
-                finally:
-                    if hasattr(r, "close"):
-                        r.close()
-                        if request_id in REQUEST_POOL:
-                            REQUEST_POOL.remove(request_id)
-
-            r = requests.request(
-                method=request.method,
-                url=target_url,
-                data=body,
-                headers=headers,
-                stream=True,
-            )
-
-            r.raise_for_status()
-
-            # r.close()
-
-            return StreamingResponse(
-                stream_content(),
-                status_code=r.status_code,
-                headers=dict(r.headers),
-            )
-        except Exception as e:
-            raise e
-
-    try:
-        return await run_in_threadpool(get_request)
-    except Exception as e:
-        error_detail = "Open WebUI: Server Connection Error"
-        if r is not None:
-            try:
-                res = r.json()
-                if "error" in res:
-                    error_detail = f"Ollama: {res['error']}"
-            except:
-                error_detail = f"Ollama: {e}"
-
-        raise HTTPException(
-            status_code=r.status_code if r else 500,
-            detail=error_detail,
-        )
